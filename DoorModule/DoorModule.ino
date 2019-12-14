@@ -1,13 +1,20 @@
 //CPE 123 Group 2 -- Home-Pass Door Station Code //COM 11
 #include <ESP8266WiFi.h>
+#include <sstream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <AsyncDelay.h>
+#include <iostream> 
+#include <string>
+#include <rdm6300.h>
+#include <Servo.h>
 
-byte connection_ledPin = 16;
-byte sync_ledPin = 15;
-byte button_pin = 5;
+#define RDM6300_RX_PIN 13 // can be only 13 - on esp8266 force hardware uart!
+#define SERVO_PIN 5
+
+Rdm6300 rdm6300;
+Servo doorServo;
 
 char ssid[] = "HomePassHub";         
 char pass[] = "cpe123g2Gang";        
@@ -16,103 +23,161 @@ IPAddress server(192,168,4,15);
 WiFiClient client;
 
 void setup() {
-  Serial.begin(9600);
-  while(!Serial){}
-  pinMode(connection_ledPin, OUTPUT);
-  pinMode(sync_ledPin, OUTPUT);
-  pinMode(button_pin, INPUT_PULLUP);
-  Serial.println("DoorModule successfully initiated.");
+  Serial1.begin(115200);
+  while(!Serial1){}
+  Serial1.println("DoorModule successfully initiated.");
+  hardwareSetup();
   wifiSetup();
+}
+
+void hardwareSetup(){
+  rdm6300.begin(RDM6300_RX_PIN);
+  doorServo.attach(SERVO_PIN);
+  doorSwitch(1); //Defaults the door to closed
 }
 
 void wifiSetup(){
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, pass);           // connects to the WiFi AP
-  Serial.println();
-  Serial.println("Attempting to connect to HubModule");
+  Serial1.println();
+  Serial1.println("Attempting to connect to HubModule");
   while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
+    Serial1.print(".");
     delay(500);
   }
-  Serial.println();
-  Serial.println("Connection Successful...");
-  Serial.print("LocalIP:"); Serial.println(WiFi.localIP());
-  Serial.println("MAC:" + WiFi.macAddress());
-  Serial.print("Gateway:"); Serial.println(WiFi.gatewayIP());
-  Serial.print("AP MAC:"); Serial.println(WiFi.BSSIDstr());
+  Serial1.println();
+  Serial1.println("Connection Successful...");
+  Serial1.print("LocalIP:"); Serial1.println(WiFi.localIP());
+  Serial1.println("MAC:" + WiFi.macAddress());
+  Serial1.print("Gateway:"); Serial1.println(WiFi.gatewayIP());
+  Serial1.print("AP MAC:"); Serial1.println(WiFi.BSSIDstr());
 }
 
 void loop() {
-  requestCommsPerm();
-  delay(9000);
+  verifyRFID();
+  verifyState();
 }
 
-bool requestCommsPerm(){
-  client.connect(server, 80);
-  digitalWrite(connection_ledPin, LOW);
-  Serial.println("Sending permission request to hub module.");
+void verifyRFID(){
+  static AsyncDelay readDelay;
+  String rfidTag;
+  
+  char tag1[8]; 
+  char tag2[8];
+  bool updateTag = rdm6300.update();
 
-  client.print("x1");
-  String answer = client.readStringUntil('\r');
-  client.flush();
-  client.stop();
+  if(updateTag){
+    rfidTag = intToString(rdm6300.get_tag_id());
+    char receivedTag[14];
 
-  Serial.println("Received: " + answer);
+    strcpy(receivedTag, requestCurrentRFID().c_str());
 
-  if(answer == "i1"){
-    Serial.println("Communication accepted -- Identity request received from hub module");
-    return true;
-  } else {
-    Serial.println("Communication rejected from hub module");
-    return false;
+    strncpy(tag1, receivedTag, 7);
+    strcpy(tag2, &receivedTag[7]);
+
+    tag1[7] = '\0';
+    
+    Serial1.println(String(tag1) + " " + String(tag2));
   }
-  return false;
+  
+  if(readDelay.isExpired()){
+    if(updateTag){
+      if(String(tag1)==rfidTag|| String(tag2)==rfidTag){
+        toggleDoor();
+        readDelay.start(5000, AsyncDelay::MILLIS);
+      }
+    }
+  }
 }
 
+void verifyState(){
+  static AsyncDelay intervalTimer;
+  String statesReceived;
+  static bool hasHubReset = false;
+
+  if(intervalTimer.isExpired()){
+    statesReceived = requestStateData();
+    intervalTimer.start(9000, AsyncDelay::MILLIS);
+  }
+  if(statesReceived == "1"){
+    Serial1.println("Actual state received: " + statesReceived);
+    hasHubReset = true;
+  }
+  if(statesReceived == "0"){
+    if(hasHubReset){
+      Serial1.println("Actual state received: " + statesReceived);
+      doorSwitch(0);
+      hasHubReset = false;
+    }
+  }
+}
+
+//DOOR SERVO FUNCTIONS
+void toggleDoor(){
+  Serial1.println(getDoorPosition());
+  if(getDoorPosition()==180){
+    doorSwitch(0);
+  } else {
+    doorSwitch(1);
+  }
+}
+
+int getDoorPosition(){
+  return doorServo.read();
+}
+
+void openDoor(){
+  doorServo.write(90);
+}
+
+void closeDoor(){
+  doorServo.write(180);
+}
+
+void doorSwitch(int openOrClose){
+  enum{OPEN_DOOR, CLOSE_DOOR};
+  switch(openOrClose){
+    case OPEN_DOOR:
+        openDoor(); //writes 90 degrees
+    break;
+
+    case CLOSE_DOOR:
+        closeDoor(); //writes 180 degrees
+    break;
+  }
+}
+
+//COMMUNICATION TASKS
 String contactHubWithInt(int intToSend){
   client.connect(server, 80);
-  digitalWrite(connection_ledPin, LOW);
-  Serial.println("********************************");
-  Serial.print("Data sent to the AP: ");
-
-  Serial.println(intToString(intToSend));
+  Serial1.println("Sending Data: " + intToString(intToSend));
   client.print(intToString(intToSend) + "\r");
-  
   String answer = client.readStringUntil('\r');
-  Serial.println("From the AP: " + answer);
   client.flush();
-  digitalWrite(connection_ledPin, HIGH);
   client.stop();
-
   return answer.c_str();
 }
 
+String requestCurrentRFID(){
+  String currentTag = contactHubWithInt(90);
+  Serial1.println("Tag Code Received: " + currentTag);
+  return currentTag;
+}
+
+String requestStateData(){
+  String stateData = contactHubWithInt(50);
+  Serial1.println("State Data Received: " + stateData);
+  return stateData; 
+}
+
+//DATA MANIPULATION FUNCTIONS
 String intToString(int input){
   char int2char[20];
   itoa(input, int2char, 10);
-
   return String(int2char);
 }
 
-void blinkLedFromButton(){
-  enum{LED_ON, LED_OFF};
-  static int state = LED_OFF;
-
-  switch(state){
-    case LED_OFF:
-      if(digitalRead(button_pin)==HIGH){
-        state = LED_ON;
-        contactHubWithInt(1);
-        digitalWrite(sync_ledPin, HIGH);
-      }
-    break;
-
-    case LED_ON:
-      if(digitalRead(button_pin)==LOW){
-        state = LED_OFF;
-        contactHubWithInt(0);
-        digitalWrite(sync_ledPin, LOW);
-      }
-    break;
-  }
+int stringToInt(String input){
+  int x = atoi(input.c_str());
+  return x;
 }
